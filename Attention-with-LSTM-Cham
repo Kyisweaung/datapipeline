@@ -1,0 +1,626 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, LSTM, Dense, Dropout,
+    Concatenate, Bidirectional,
+    LayerNormalization, Softmax, Lambda
+)
+from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import mean_absolute_error, r2_score
+from pyspark.sql.functions import col
+
+# =========================
+# CONFIG
+# =========================
+HIST_DAYS = 30
+TARGET_DAYS = 10
+
+BATCH_SIZE = 128
+EPOCHS = 120
+LR = 2e-4
+DROPOUT = 0.2
+
+ENC1 = 192
+ENC2 = 128
+STATIC_UNITS = 128
+ATTN_UNITS = 128   # attention projection size
+
+CONF_LOW = 7.5
+CONF_HIGH = 92.5
+
+SOURCE_TABLE = "default.kpi_tmp_all_trans_liquidity_sub_base3_uu1_update5_consequence_high_user_H"
+OUTPUT_TABLE = "default.lstm_attention_day1_10_predictions"
+
+spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_TABLE}")
+
+# =========================
+# LOAD DATA
+# =========================
+df = spark.table(SOURCE_TABLE)
+
+for c, t in df.dtypes:
+    if c != "msisdn" and t not in ["double", "float"]:
+        df = df.withColumn(c, col(c).cast("double"))
+
+hist_cols   = [f"hist_day{i}_bal" for i in range(1, HIST_DAYS + 1)]
+target_cols = [f"day{i}_bal" for i in range(1, TARGET_DAYS + 1)]
+
+static_cols = [c for c in df.columns if c not in hist_cols + target_cols + ["msisdn"]]
+
+pdf = df.toPandas().fillna(0.0)
+
+hist_scale   = np.maximum(np.percentile(pdf[hist_cols], 99), 1.0)
+static_scale = np.maximum(np.percentile(pdf[static_cols], 99), 1.0)
+target_scale = np.maximum(np.percentile(pdf[target_cols], 99), 1.0)
+
+X_hist = (pdf[hist_cols].values / hist_scale).reshape(-1, HIST_DAYS, 1).astype("float32")
+X_static = (pdf[static_cols].values / static_scale).astype("float32")
+y = (pdf[target_cols].values / target_scale).reshape(-1, TARGET_DAYS, 1).astype("float32")
+
+msisdn_pdf = pdf[["msisdn"]]
+
+# =========================
+# WEIGHTED HUBER LOSS
+# =========================
+def weighted_huber_loss(y_true, y_pred):
+    weights = tf.constant(
+        [1.0, 1.0, 0.9, 0.9, 0.8, 0.7, 0.6, 0.6, 0.5, 0.5],
+        dtype=tf.float32
+    )
+
+    error = tf.abs(y_true - y_pred)
+    delta = 3.0
+
+    huber = tf.where(
+        error < delta,
+        0.5 * tf.square(error),
+        delta * (error - 0.5 * delta)
+    )
+
+    return tf.reduce_mean(huber * weights)
+
+# =========================
+# MODEL: LSTM + ATTENTION
+# =========================
+hist_input = Input((HIST_DAYS, 1), name="hist_input")
+static_input = Input((len(static_cols),), name="static_input")
+
+# BiLSTM encoder
+x = Bidirectional(LSTM(ENC1, return_sequences=True))(hist_input)
+x = LayerNormalization()(x)
+x = Dropout(DROPOUT)(x)
+
+x = Bidirectional(LSTM(ENC2, return_sequences=True))(x)
+x = LayerNormalization()(x)
+
+# -------------------------
+# TEMPORAL ATTENTION
+# -------------------------
+score = Dense(ATTN_UNITS, activation="tanh")(x)
+score = Dense(1)(score)                            # (B, T, 1)
+weights = Softmax(axis=1)(score)                  # attention weights
+context = Lambda(lambda inputs: tf.reduce_sum(inputs[0] * inputs[1], axis=1))([x, weights])  # weighted sum (B, features)
+
+# Static features
+s = Dense(STATIC_UNITS, activation="relu")(static_input)
+
+# Combine
+x = Concatenate()([context, s])
+x = Dense(128, activation="relu")(x)
+x = Dropout(0.2)(x)
+
+# Outputs
+outputs = [Dense(1, activation="softplus", name=f"day{i+1}_out")(x) for i in range(TARGET_DAYS)]
+
+out = tf.keras.layers.Concatenate(axis=1)(outputs)
+out = tf.keras.layers.Reshape((TARGET_DAYS, 1))(out)
+
+model = Model([hist_input, static_input], out)
+
+model.compile(
+    optimizer=Adam(learning_rate=LR),
+    loss=weighted_huber_loss,
+    metrics=["mae"]
+)
+
+model.summary()
+
+# =========================
+# TRAIN
+# =========================
+model.fit(
+    {"hist_input": X_hist, "static_input": X_static},
+    y,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    verbose=2
+)
+
+# =========================
+# PREDICTION
+# =========================
+y_pred = model.predict({"hist_input": X_hist, "static_input": X_static})
+y_pred = np.maximum(y_pred * target_scale, 0.0)
+
+y_true = pdf[target_cols].values.reshape(-1, TARGET_DAYS, 1)
+
+print("\nPer-day MAE & R²:")
+for i in range(TARGET_DAYS):
+    mae = mean_absolute_error(y_true[:, i, 0], y_pred[:, i, 0])
+    r2  = r2_score(y_true[:, i, 0], y_pred[:, i, 0])
+    print(f"Day {i+1}: MAE={mae:,.0f}, R²={r2:.4f}")
+
+# =========================
+# CONFIDENCE BANDS
+# =========================
+residuals = y_true[:, :, 0] - y_pred[:, :, 0]
+
+lower_err = np.percentile(residuals, CONF_LOW, axis=0)
+upper_err = np.percentile(residuals, CONF_HIGH, axis=0)
+
+lower_bound = np.maximum(y_pred[:, :, 0] + lower_err, 0.0)
+upper_bound = y_pred[:, :, 0] + upper_err
+
+coverage = np.mean(
+    (y_true[:, :, 0] >= lower_bound) & (y_true[:, :, 0] <= upper_bound)
+)
+
+print(f"\n✅ Band Coverage: {coverage:.2%}")
+
+# =========================
+# SAVE OUTPUT
+# =========================
+out_pdf = msisdn_pdf.copy()
+
+for i in range(TARGET_DAYS):
+    out_pdf[f"pred_day{i+1}_bal"]  = y_pred[:, i, 0]
+    out_pdf[f"lower_day{i+1}_bal"] = lower_bound[:, i]
+    out_pdf[f"upper_day{i+1}_bal"] = upper_bound[:, i]
+    out_pdf[f"true_day{i+1}_bal"]  = y_true[:, i, 0]
+
+out_pdf["model_name"] = "lstm_attention_day1_10"
+out_pdf["model_version"] = "v1"
+
+spark.createDataFrame(out_pdf) \
+    .write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(OUTPUT_TABLE)
+
+print(f"\n✅ Saved to {OUTPUT_TABLE}")
+-------------------------------------------------------day11 day 20 -------------------------------
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, LSTM, Dense, Dropout, Concatenate,
+    Bidirectional, LayerNormalization,
+    Softmax, Lambda
+)
+from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import mean_absolute_error, r2_score
+from pyspark.sql.functions import col
+
+
+# =========================
+# CONFIG
+# =========================
+HIST_DAYS = 30
+TARGET_DAYS = 10          # day11–day20 → COUNT = 10
+
+BATCH_SIZE = 128
+EPOCHS = 120
+LR = 2e-4
+DROPOUT = 0.2
+
+ENC1 = 192
+ENC2 = 128
+STATIC_UNITS = 128
+ATTN_UNITS = 128
+
+CONF_LOW = 7.5
+CONF_HIGH = 92.5
+
+SOURCE_TABLE = "default.kpi_tmp_all_trans_liquidity_sub_base3_uu1_update5_consequence_high_user_H_mid"
+OUTPUT_TABLE = "default.lstm_attention_day11_20_predictions_mid"
+
+spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_TABLE}")
+
+
+# =========================
+# LOAD DATA
+# =========================
+df = spark.table(SOURCE_TABLE)
+
+for c, t in df.dtypes:
+    if c != "msisdn" and t not in ["double", "float"]:
+        df = df.withColumn(c, col(c).cast("double"))
+
+hist_cols = [f"hist_day{i}_bal" for i in range(1, HIST_DAYS + 1)]
+target_cols = [f"day{i}_bal" for i in range(11, 21)]   # ⬅️ ONLY day11–20
+
+static_cols = [
+    c for c in df.columns
+    if c not in hist_cols + target_cols + ["msisdn"]
+]
+
+pdf = df.toPandas().fillna(0.0)
+
+
+# =========================
+# SCALING
+# =========================
+hist_scale   = np.maximum(np.percentile(pdf[hist_cols], 99), 1.0)
+static_scale = np.maximum(np.percentile(pdf[static_cols], 99), 1.0)
+target_scale = np.maximum(np.percentile(pdf[target_cols], 99), 1.0)
+
+X_hist = (pdf[hist_cols].values / hist_scale).reshape(-1, HIST_DAYS, 1).astype("float32")
+X_static = (pdf[static_cols].values / static_scale).astype("float32")
+y = (pdf[target_cols].values / target_scale).reshape(-1, TARGET_DAYS, 1).astype("float32")
+
+msisdn_pdf = pdf[["msisdn"]]
+
+
+# =========================
+# HORIZON-AWARE WEIGHTED HUBER
+# =========================
+def weighted_huber_loss(y_true, y_pred):
+    """
+    Day11–Day20 → far horizon → lower & decaying importance
+    """
+    weights = tf.constant(
+        [0.6, 0.6, 0.55, 0.55, 0.5, 0.45, 0.45, 0.4, 0.4, 0.35],
+        dtype=tf.float32
+    )
+
+    error = tf.abs(y_true - y_pred)
+    delta = 3.0
+
+    huber = tf.where(
+        error < delta,
+        0.5 * tf.square(error),
+        delta * (error - 0.5 * delta)
+    )
+
+    return tf.reduce_mean(huber * weights)
+
+
+# =========================
+# MODEL: LSTM + TEMPORAL ATTENTION
+# =========================
+hist_input = Input((HIST_DAYS, 1), name="hist_input")
+static_input = Input((len(static_cols),), name="static_input")
+
+# ---- Encoder
+x = Bidirectional(LSTM(ENC1, return_sequences=True))(hist_input)
+x = LayerNormalization()(x)
+x = Dropout(DROPOUT)(x)
+
+x = Bidirectional(LSTM(ENC2, return_sequences=True))(x)
+x = LayerNormalization()(x)
+
+# ---- Temporal Attention (Keras-safe)
+score = Dense(ATTN_UNITS, activation="tanh")(x)
+score = Dense(1)(score)                  # (B, T, 1)
+weights = Softmax(axis=1)(score)
+
+context = Lambda(
+    lambda z: tf.reduce_sum(z[0] * z[1], axis=1)
+)([x, weights])                          # (B, features)
+
+# ---- Static features
+s = Dense(STATIC_UNITS, activation="relu")(static_input)
+
+# ---- Fusion
+x = Concatenate()([context, s])
+x = Dense(128, activation="relu")(x)
+x = Dropout(0.2)(x)
+
+# ---- Outputs (day11–day20)
+outputs = [
+    Dense(1, activation="softplus", name=f"day{11+i}_out")(x)
+    for i in range(TARGET_DAYS)
+]
+
+out = Concatenate(axis=1)(outputs)
+out = tf.keras.layers.Reshape((TARGET_DAYS, 1))(out)
+
+model = Model([hist_input, static_input], out)
+
+model.compile(
+    optimizer=Adam(learning_rate=LR),
+    loss=weighted_huber_loss,
+    metrics=["mae"]
+)
+
+model.summary()
+
+
+# =========================
+# TRAIN
+# =========================
+model.fit(
+    {"hist_input": X_hist, "static_input": X_static},
+    y,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    verbose=2
+)
+
+
+# =========================
+# PREDICTION & METRICS
+# =========================
+y_pred = model.predict({"hist_input": X_hist, "static_input": X_static})
+y_pred = np.maximum(y_pred * target_scale, 0.0)
+
+y_true = pdf[target_cols].values.reshape(-1, TARGET_DAYS, 1)
+
+print("\nPer-day MAE & R² (Day11–Day20):")
+for i in range(TARGET_DAYS):
+    mae = mean_absolute_error(y_true[:, i, 0], y_pred[:, i, 0])
+    r2  = r2_score(y_true[:, i, 0], y_pred[:, i, 0])
+    print(f"Day {11+i}: MAE={mae:,.0f}, R²={r2:.4f}")
+
+
+# =========================
+# CONFIDENCE BANDS
+# =========================
+residuals = y_true[:, :, 0] - y_pred[:, :, 0]
+
+lower_err = np.percentile(residuals, CONF_LOW, axis=0)
+upper_err = np.percentile(residuals, CONF_HIGH, axis=0)
+
+lower_bound = np.maximum(y_pred[:, :, 0] + lower_err, 0.0)
+upper_bound = y_pred[:, :, 0] + upper_err
+
+coverage = np.mean(
+    (y_true[:, :, 0] >= lower_bound) &
+    (y_true[:, :, 0] <= upper_bound)
+)
+
+print(f"\nBand Coverage: {coverage:.2%}")
+
+
+# =========================
+# SAVE OUTPUT
+# =========================
+out_pdf = msisdn_pdf.copy()
+
+for i in range(TARGET_DAYS):
+    out_pdf[f"pred_day{11+i}_bal"]  = y_pred[:, i, 0]
+    out_pdf[f"lower_day{11+i}_bal"] = lower_bound[:, i]
+    out_pdf[f"upper_day{11+i}_bal"] = upper_bound[:, i]
+    out_pdf[f"true_day{11+i}_bal"]  = y_true[:, i, 0]
+
+out_pdf["model_name"] = "lstm_attention_day11_20"
+out_pdf["model_version"] = "v1"
+
+spark.createDataFrame(out_pdf) \
+    .write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(OUTPUT_TABLE)
+
+print(f"\nSaved to {OUTPUT_TABLE}")
+-----------------------------------------------------day21 to day30 ------------------------
+
+# =========================================================
+# LSTM + TEMPORAL ATTENTION : DAY21 → DAY30 (FULL VERSION)
+# =========================================================
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, LSTM, Dense, Dropout,
+    Concatenate, Bidirectional,
+    LayerNormalization, Softmax, Lambda
+)
+from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import mean_absolute_error, r2_score
+from pyspark.sql.functions import col
+
+# =========================
+# CONFIG
+# =========================
+HIST_DAYS = 30
+TARGET_DAYS = 10            # day21 → day30
+START_DAY = 21
+
+BATCH_SIZE = 128
+EPOCHS = 120
+LR = 2e-4
+DROPOUT = 0.2
+
+ENC1 = 192
+ENC2 = 128
+STATIC_UNITS = 128
+ATTN_UNITS = 128
+
+CONF_LOW = 7.5
+CONF_HIGH = 92.5
+
+SOURCE_TABLE = "default.kpi_tmp_all_trans_liquidity_sub_base3_uu1_update5_consequence_high_user_H_last"
+OUTPUT_TABLE = "default.lstm_attention_day21_30_predictions_last"
+
+spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_TABLE}")
+
+# =========================
+# LOAD DATA
+# =========================
+df = spark.table(SOURCE_TABLE)
+
+for c, t in df.dtypes:
+    if c != "msisdn" and t not in ["double", "float"]:
+        df = df.withColumn(c, col(c).cast("double"))
+
+hist_cols = [f"hist_day{i}_bal" for i in range(1, HIST_DAYS + 1)]
+target_cols = [f"day{i}_bal" for i in range(START_DAY, START_DAY + TARGET_DAYS)]
+
+static_cols = [
+    c for c in df.columns
+    if c not in hist_cols + target_cols + ["msisdn"]
+]
+
+pdf = df.toPandas().fillna(0.0)
+
+# =========================
+# SCALING
+# =========================
+hist_scale   = np.maximum(np.percentile(pdf[hist_cols], 99), 1.0)
+static_scale = np.maximum(np.percentile(pdf[static_cols], 99), 1.0)
+target_scale = np.maximum(np.percentile(pdf[target_cols], 99), 1.0)
+
+X_hist = (pdf[hist_cols].values / hist_scale) \
+    .reshape(-1, HIST_DAYS, 1).astype("float32")
+
+X_static = (pdf[static_cols].values / static_scale).astype("float32")
+
+y = (pdf[target_cols].values / target_scale) \
+    .reshape(-1, TARGET_DAYS, 1).astype("float32")
+
+msisdn_pdf = pdf[["msisdn"]]
+
+# =========================
+# WEIGHTED HUBER LOSS
+# =========================
+def weighted_huber_loss(y_true, y_pred):
+    weights = tf.constant(
+        [1.0, 1.0, 0.9, 0.9, 0.8, 0.7, 0.6, 0.6, 0.5, 0.5],
+        dtype=tf.float32
+    )
+    error = tf.abs(y_true - y_pred)
+    delta = 3.0
+
+    huber = tf.where(
+        error < delta,
+        0.5 * tf.square(error),
+        delta * (error - 0.5 * delta)
+    )
+    return tf.reduce_mean(huber * weights)
+
+# =========================
+# MODEL
+# =========================
+hist_input = Input((HIST_DAYS, 1), name="hist_input")
+static_input = Input((len(static_cols),), name="static_input")
+
+x = Bidirectional(LSTM(ENC1, return_sequences=True))(hist_input)
+x = LayerNormalization()(x)
+x = Dropout(DROPOUT)(x)
+
+x = Bidirectional(LSTM(ENC2, return_sequences=True))(x)
+x = LayerNormalization()(x)
+
+# -------- TEMPORAL ATTENTION --------
+score = Dense(ATTN_UNITS, activation="tanh")(x)
+score = Dense(1)(score)
+weights = Softmax(axis=1)(score)
+
+context = Lambda(
+    lambda z: tf.reduce_sum(z[0] * z[1], axis=1),
+    name="attention_context"
+)([x, weights])
+
+# Static branch
+s = Dense(STATIC_UNITS, activation="relu")(static_input)
+
+# Fusion
+x = Concatenate()([context, s])
+x = Dense(128, activation="relu")(x)
+x = Dropout(DROPOUT)(x)
+
+# Outputs: day21 → day30
+outputs = [
+    Dense(1, activation="softplus", name=f"day{START_DAY+i}_out")(x)
+    for i in range(TARGET_DAYS)
+]
+
+out = Concatenate(axis=1)(outputs)
+out = tf.keras.layers.Reshape((TARGET_DAYS, 1))(out)
+
+model = Model([hist_input, static_input], out)
+
+model.compile(
+    optimizer=Adam(learning_rate=LR),
+    loss=weighted_huber_loss,
+    metrics=["mae"]
+)
+
+model.summary()
+
+# =========================
+# TRAIN
+# =========================
+model.fit(
+    {"hist_input": X_hist, "static_input": X_static},
+    y,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    verbose=2
+)
+
+# =========================
+# PREDICTION
+# =========================
+y_pred = model.predict({"hist_input": X_hist, "static_input": X_static})
+y_pred = np.maximum(y_pred * target_scale, 0.0)
+
+y_true = pdf[target_cols].values.reshape(-1, TARGET_DAYS, 1)
+
+print("\nPer-day MAE & R²:")
+for i in range(TARGET_DAYS):
+    mae = mean_absolute_error(y_true[:, i, 0], y_pred[:, i, 0])
+    r2  = r2_score(y_true[:, i, 0], y_pred[:, i, 0])
+    print(f"Day {START_DAY+i}: MAE={mae:,.0f}, R²={r2:.4f}")
+
+# =========================
+# CONFIDENCE BANDS
+# =========================
+residuals = y_true[:, :, 0] - y_pred[:, :, 0]
+
+lower_err = np.percentile(residuals, CONF_LOW, axis=0)
+upper_err = np.percentile(residuals, CONF_HIGH, axis=0)
+
+lower_bound = np.maximum(y_pred[:, :, 0] + lower_err, 0.0)
+upper_bound = y_pred[:, :, 0] + upper_err
+
+coverage = np.mean(
+    (y_true[:, :, 0] >= lower_bound) &
+    (y_true[:, :, 0] <= upper_bound)
+)
+
+print(f"\nBand Coverage: {coverage:.2%}")
+
+# =========================
+# SAVE OUTPUT
+# =========================
+out_pdf = msisdn_pdf.copy()
+
+for i in range(TARGET_DAYS):
+    d = START_DAY + i
+    out_pdf[f"pred_day{d}_bal"]  = y_pred[:, i, 0]
+    out_pdf[f"lower_day{d}_bal"] = lower_bound[:, i]
+    out_pdf[f"upper_day{d}_bal"] = upper_bound[:, i]
+    out_pdf[f"true_day{d}_bal"]  = y_true[:, i, 0]
+
+out_pdf["model_name"] = "lstm_attention_day21_30"
+out_pdf["model_version"] = "v1"
+
+spark.createDataFrame(out_pdf) \
+    .write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(OUTPUT_TABLE)
+
+print(f"\nSaved to {OUTPUT_TABLE}")
+
