@@ -1,1 +1,146 @@
 
+
+# TUNED XGBOOST – DIRECT DAY1 → DAY30 FORECAST  (created by kyi swe aung)
+
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, r2_score
+from pyspark.sql.functions import col
+
+# -------------------------
+# CONFIG
+# -------------------------
+HIST_DAYS = 30
+TARGET_DAYS = 30  # extend to 30 days
+CONF_LOW = 7.5
+CONF_HIGH = 92.5
+
+SOURCE_TABLE = "default.kpi_tmp_all_trans_liquidity_sub_base3_uu1_update5_consequence_high_user_day30"
+OUTPUT_TABLE = "default.xgboost_day1_30_tuned"
+
+spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_TABLE}")
+
+# -------------------------
+# LOAD & CAST DATA
+# -------------------------
+df = spark.table(SOURCE_TABLE)
+for c, t in df.dtypes:
+    if c != "msisdn" and t not in ["double", "float"]:
+        df = df.withColumn(c, col(c).cast("double"))
+
+hist_cols   = [f"hist_day{i}_bal" for i in range(1, HIST_DAYS + 1)]
+target_cols = [f"day{i}_bal" for i in range(1, TARGET_DAYS + 1)]
+static_cols = [c for c in df.columns if c not in hist_cols + target_cols + ["msisdn"]]
+
+pdf = df.toPandas().fillna(0.0)
+msisdn_pdf = pdf[["msisdn"]]
+
+# -------------------------
+# FEATURE ENGINEERING
+# -------------------------
+pdf_fe = pdf.copy()
+
+# Rolling mean 3-day
+for i in range(3, HIST_DAYS+1):
+    pdf_fe[f"hist_roll3_day{i}"] = pdf_fe[[f"hist_day{j}_bal" for j in range(i-2, i+1)]].mean(axis=1)
+
+# Rolling std 7-day
+for i in range(7, HIST_DAYS+1):
+    pdf_fe[f"hist_std7_day{i}"] = pdf_fe[[f"hist_day{j}_bal" for j in range(i-6, i+1)]].std(axis=1)
+
+# Day-over-day difference
+for i in range(2, HIST_DAYS+1):
+    pdf_fe[f"hist_diff_day{i}"] = pdf_fe[f"hist_day{i}_bal"] - pdf_fe[f"hist_day{i-1}_bal"]
+
+# Combine all input columns
+X_cols = [c for c in pdf_fe.columns if c not in target_cols + ["msisdn"]]
+hist_scale   = np.maximum(np.percentile(pdf_fe[X_cols], 99), 1.0)
+X = (pdf_fe[X_cols] / hist_scale).values.astype("float32")
+
+Y = (pdf[target_cols].values / np.maximum(np.percentile(pdf[target_cols], 99), 1.0)).astype("float32")
+y_true = pdf[target_cols].values
+target_scale = np.maximum(np.percentile(pdf[target_cols], 99), 1.0)
+
+# -------------------------
+# TUNED HYPERPARAMETERS
+# -------------------------
+params = {
+    "objective": "reg:absoluteerror",
+    "eval_metric": "mae",
+    "max_depth": 12,
+    "eta": 0.015,
+    "subsample": 0.85,
+    "colsample_bytree": 0.7,
+    "lambda": 3.0,
+    "alpha": 1.5,
+    "min_child_weight": 8,
+    "seed": 42
+}
+
+num_boost_round = 1500
+early_stopping_rounds = 100
+
+# -------------------------
+# TRAIN MULTI-DAY FORECAST WITH AUTO-REGRESSION
+# -------------------------
+y_pred = np.zeros_like(Y)
+X_train = X.copy()
+
+for i in range(TARGET_DAYS):
+    print(f"\n▶ Training XGBoost for Day {i+1}")
+    dtrain = xgb.DMatrix(X_train, label=Y[:, i])
+    model = xgb.train(params, dtrain,
+                      num_boost_round=num_boost_round,
+                      early_stopping_rounds=early_stopping_rounds,
+                      evals=[(dtrain, "train")],
+                      verbose_eval=50)
+    
+    y_pred[:, i] = model.predict(dtrain)
+    
+    # Auto-regressive: add previous prediction as new feature for next day
+    if i < TARGET_DAYS - 1:
+        X_train = np.hstack([X_train, y_pred[:, i].reshape(-1, 1)])
+
+# -------------------------
+# INVERSE SCALE & METRICS
+# -------------------------
+y_pred = np.maximum(y_pred * target_scale, 0.0)
+
+print("\nPer-day MAE & R² (Tuned XGBoost):")
+for i in range(TARGET_DAYS):
+    mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
+    r2  = r2_score(y_true[:, i], y_pred[:, i])
+    print(f"Day {i+1}: MAE={mae:,.0f}, R²={r2:.4f}")
+
+# -------------------------
+# CONFIDENCE BANDS
+# -------------------------
+residuals = y_true - y_pred
+lower_err = np.percentile(residuals, CONF_LOW, axis=0)
+upper_err = np.percentile(residuals, CONF_HIGH, axis=0)
+lower_bound = np.maximum(y_pred + lower_err, 0.0)
+upper_bound = y_pred + upper_err
+coverage = np.mean((y_true >= lower_bound) & (y_true <= upper_bound))
+print(f"\n✅ Band Coverage: {coverage:.2%}")
+
+# -------------------------
+# SAVE OUTPUT
+# -------------------------
+out_pdf = msisdn_pdf.copy()
+for i in range(TARGET_DAYS):
+    out_pdf[f"pred_day{i+1}_bal"]  = y_pred[:, i]
+    out_pdf[f"lower_day{i+1}_bal"] = lower_bound[:, i]
+    out_pdf[f"upper_day{i+1}_bal"] = upper_bound[:, i]
+    out_pdf[f"true_day{i+1}_bal"]  = y_true[:, i]
+
+out_pdf["model_name"] = "xgboost_day1_30_tuned"
+out_pdf["model_version"] = "v1"
+
+spark.createDataFrame(out_pdf)\
+    .write.format("delta")\
+    .mode("overwrite")\
+    .saveAsTable(OUTPUT_TABLE)
+
+print(f"\n✅ Saved to {OUTPUT_TABLE}")
